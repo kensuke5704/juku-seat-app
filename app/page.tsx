@@ -83,6 +83,7 @@ type SeatingWarning = {
 type UploadedImage = {
   fileName: string;
   previewUrl: string;
+  file: File;
 };
 
 type ScreenId = "upload" | "ocr" | "seating" | "teachers" | "students" | "warnings" | "settings";
@@ -435,8 +436,12 @@ function getAssignmentSummary(assignments: Assignment[], warnings: SeatingWarnin
 function parseOcrText(text: string, period: number, sourceImageIndex: 1 | 2): RawRow[] {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const headerIndex = lines.findIndex((line) => /(講師|担当講師|先生)/.test(line) && line.includes("生徒") && line.includes("学年"));
-  if (headerIndex < 0) return [];
-  return lines.slice(headerIndex + 1).map((line, index) => {
+  const dataLines = (headerIndex >= 0 ? lines.slice(headerIndex + 1) : lines).filter((line) => {
+    if (/(講師|担当講師|先生).*(生徒).*(学年)/.test(line)) return false;
+    if (/^(コマ|一覧表|教室|座席|時間割|氏名)$/.test(line)) return false;
+    return line.split(/[\s　\t]+/).filter(Boolean).length >= 2;
+  });
+  return dataLines.map((line, index) => {
     const parsed = parseDataLine(line);
     return {
       id: `ocr-${period}-${sourceImageIndex}-${Date.now()}-${index}`,
@@ -482,6 +487,21 @@ async function runOcrPlaceholder(period: number, sourceImageIndex: 1 | 2, rawTex
   return parseOcrText(rawText, period, sourceImageIndex);
 }
 
+async function recognizeImageText(file: File, onProgress: (message: string) => void) {
+  onProgress("OCRを準備しています");
+  const { recognize } = await import("tesseract.js");
+  const result = await recognize(file, "jpn+eng", {
+    logger: (message) => {
+      if (message.status === "recognizing text") {
+        onProgress(`OCR実行中 ${Math.round(message.progress * 100)}%`);
+        return;
+      }
+      if (message.status) onProgress(`OCR実行中: ${message.status}`);
+    },
+  });
+  return result.data.text.trim();
+}
+
 function classNames(...values: Array<string | false | undefined>) {
   return values.filter(Boolean).join(" ");
 }
@@ -496,6 +516,7 @@ export default function Home() {
   const [config, setConfig] = useState<BuildingConfig>(defaultBuildingConfig);
   const [assignmentOverrides, setAssignmentOverrides] = useState<Record<string, AssignmentOverride>>({});
   const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrStatus, setOcrStatus] = useState("");
 
   const lessons = useMemo(() => rowsToLessons(rows), [rows]);
   const assignments = useMemo(() => createAssignments(lessons, config, assignmentOverrides), [lessons, config, assignmentOverrides]);
@@ -564,9 +585,10 @@ export default function Home() {
       ...current,
       [selectedPeriod]: {
         ...(current[selectedPeriod] ?? {}),
-        [source]: { fileName: file.name, previewUrl },
+        [source]: { fileName: file.name, previewUrl, file },
       },
     }));
+    event.target.value = "";
   }
 
   function deleteImage(source: 1 | 2) {
@@ -580,19 +602,35 @@ export default function Home() {
 
   async function runOcr() {
     setOcrBusy(true);
-    const result1 = await runOcrPlaceholder(selectedPeriod, 1, rawOcrTexts[sourceKey(selectedPeriod, 1)]);
-    const result2 =
-      images[selectedPeriod]?.[2] || rawOcrTexts[sourceKey(selectedPeriod, 2)]?.trim()
-        ? await runOcrPlaceholder(selectedPeriod, 2, rawOcrTexts[sourceKey(selectedPeriod, 2)])
-        : [];
-    setRows((current) => [
-      ...current.filter((row) => row.period !== selectedPeriod),
-      ...result1,
-      ...result2,
-    ]);
-    setSelectedSource(1);
-    setActiveScreen("ocr");
-    setOcrBusy(false);
+    setOcrStatus("OCRを開始しています");
+    try {
+      const nextTexts: Record<string, string> = {};
+      const results: RawRow[] = [];
+
+      for (const source of sourceTabs) {
+        const key = sourceKey(selectedPeriod, source);
+        const image = images[selectedPeriod]?.[source];
+        const currentText = rawOcrTexts[key] ?? "";
+        const text = image?.file
+          ? await recognizeImageText(image.file, (message) => setOcrStatus(`一覧表${source}: ${message}`))
+          : currentText;
+        nextTexts[key] = text;
+        results.push(...(await runOcrPlaceholder(selectedPeriod, source, text)));
+      }
+
+      setRawOcrTexts((current) => ({ ...current, ...nextTexts }));
+      setRows((current) => [
+        ...current.filter((row) => row.period !== selectedPeriod),
+        ...results,
+      ]);
+      setSelectedSource(1);
+      setActiveScreen("ocr");
+      setOcrStatus("OCR完了");
+    } catch (error) {
+      setOcrStatus(error instanceof Error ? `OCRに失敗しました: ${error.message}` : "OCRに失敗しました");
+    } finally {
+      setOcrBusy(false);
+    }
   }
 
   return (
@@ -633,6 +671,7 @@ export default function Home() {
             deleteImage={deleteImage}
             runOcr={runOcr}
             ocrBusy={ocrBusy}
+            ocrStatus={ocrStatus}
           />
         )}
         {activeScreen === "ocr" && (
@@ -710,6 +749,7 @@ function UploadScreen(props: {
   deleteImage: (source: 1 | 2) => void;
   runOcr: () => void;
   ocrBusy: boolean;
+  ocrStatus: string;
 }) {
   const periodImages = props.images[props.selectedPeriod] ?? {};
   return (
@@ -730,12 +770,12 @@ function UploadScreen(props: {
                   <p className="truncate text-sm text-slate-600">{image.fileName}</p>
                   <div className="grid grid-cols-2 gap-2">
                     <label className="cursor-pointer rounded-md border border-appblue bg-white px-3 py-2 text-center text-sm font-bold text-appblue active:translate-y-px">
-                      写真から変更
-                      <input className="hidden" type="file" accept="image/*" onChange={(event) => props.handleImage(event, source)} />
-                    </label>
-                    <label className="cursor-pointer rounded-md border border-appblue bg-white px-3 py-2 text-center text-sm font-bold text-appblue active:translate-y-px">
                       カメラで撮影
                       <input className="hidden" type="file" accept="image/*" capture="environment" onChange={(event) => props.handleImage(event, source)} />
+                    </label>
+                    <label className="cursor-pointer rounded-md border border-appblue bg-white px-3 py-2 text-center text-sm font-bold text-appblue active:translate-y-px">
+                      写真から変更
+                      <input className="hidden" type="file" accept="image/*" onChange={(event) => props.handleImage(event, source)} />
                     </label>
                     <button type="button" onClick={() => props.deleteImage(source)} className="col-span-2 rounded-md border border-red-200 bg-white px-3 py-2 text-sm font-bold text-red-600 active:translate-y-px">
                       削除
@@ -744,13 +784,13 @@ function UploadScreen(props: {
                 </div>
               ) : (
                 <div className="grid gap-2">
-                  <label className="block cursor-pointer rounded-md border border-dashed border-blue-300 bg-white px-3 py-5 text-center text-sm font-bold text-appblue active:translate-y-px">
-                    写真から追加
-                    <input className="hidden" type="file" accept="image/*" onChange={(event) => props.handleImage(event, source)} />
-                  </label>
                   <label className="block cursor-pointer rounded-md border border-blue-200 bg-white px-3 py-3 text-center text-sm font-bold text-appblue active:translate-y-px">
                     カメラで撮影
                     <input className="hidden" type="file" accept="image/*" capture="environment" onChange={(event) => props.handleImage(event, source)} />
+                  </label>
+                  <label className="block cursor-pointer rounded-md border border-dashed border-blue-300 bg-white px-3 py-5 text-center text-sm font-bold text-appblue active:translate-y-px">
+                    写真から追加
+                    <input className="hidden" type="file" accept="image/*" onChange={(event) => props.handleImage(event, source)} />
                   </label>
                 </div>
               )}
@@ -766,6 +806,7 @@ function UploadScreen(props: {
       >
         {props.ocrBusy ? "OCR実行中" : `${props.selectedPeriod}コマのOCR実行`}
       </button>
+      {props.ocrStatus && <p className="text-center text-xs font-bold text-slate-500">{props.ocrStatus}</p>}
     </div>
   );
 }
