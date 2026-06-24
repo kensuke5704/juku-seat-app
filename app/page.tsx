@@ -98,9 +98,33 @@ type OcrWorker = {
   recognize: (
     image: string,
     options?: Partial<{ rotateAuto: boolean }>,
-    output?: Partial<{ text: boolean }>,
-  ) => Promise<{ data: { text: string; confidence?: number } }>;
+    output?: Partial<{ text: boolean; blocks: boolean; tsv: boolean }>,
+  ) => Promise<{ data: OcrPage }>;
   setParameters: (params: Record<string, string>) => Promise<unknown>;
+};
+
+type OcrPage = {
+  text: string;
+  confidence?: number;
+  blocks?: Array<{
+    paragraphs?: Array<{
+      lines?: Array<{
+        text: string;
+        confidence: number;
+        bbox?: { x0: number; y0: number; x1: number; y1: number };
+      }>;
+    }>;
+  }> | null;
+  tsv?: string | null;
+};
+
+type OcrWord = {
+  text: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  conf: number;
 };
 
 const periods = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -452,9 +476,10 @@ function parseOcrText(text: string, period: number, sourceImageIndex: 1 | 2): Ra
     if (/^(コマ|一覧表|教室|座席|時間割|氏名)$/.test(line)) return false;
     return line.split(/[\s　\t]+/).filter(Boolean).length >= 2;
   });
-  return dataLines.map((line, index) => {
-    const parsed = parseDataLine(line);
-    return {
+  return dataLines
+    .map((line) => ({ line, parsed: parseDataLine(line) }))
+    .filter(({ parsed }) => isValidParsedRow(parsed))
+    .map(({ line, parsed }, index) => ({
       id: `ocr-${period}-${sourceImageIndex}-${Date.now()}-${index}`,
       period,
       sourceImageIndex,
@@ -462,8 +487,7 @@ function parseOcrText(text: string, period: number, sourceImageIndex: 1 | 2): Ra
       studentName: parsed.studentName,
       grade: parsed.grade,
       rawText: line,
-    };
-  });
+    }));
 }
 
 function parseDataLine(line: string) {
@@ -505,6 +529,20 @@ function parseDataLine(line: string) {
   };
 }
 
+function isValidParsedRow(parsed: { teacherName?: string; studentName?: string; grade?: string }) {
+  const teacherName = cleanOcrName(parsed.teacherName ?? "");
+  const studentName = cleanOcrName(parsed.studentName ?? "");
+  return teacherName.length >= 2 && studentName.length >= 2 && isRecognizedGrade(parsed.grade);
+}
+
+function isRecognizedGrade(grade?: string) {
+  return /^(小[1-6]|中[1-3]|高[1-3]|小学生|小学[1-6]年)$/.test((grade ?? "").trim());
+}
+
+function cleanOcrName(value: string) {
+  return value.replace(/[^\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}A-Za-z\s]/gu, "").replace(/\s+/g, " ").trim();
+}
+
 async function runOcrPlaceholder(period: number, sourceImageIndex: 1 | 2, rawText?: string): Promise<RawRow[]> {
   if (!rawText?.trim()) return [];
   return parseOcrText(rawText, period, sourceImageIndex);
@@ -516,24 +554,137 @@ async function recognizeImageText(file: File, onProgress: (message: string) => v
   const worker = await getOcrWorker();
   const firstImage = await prepareImageForOcr(file, 0);
   onProgress("OCR実行中 0度");
-  const firstResult = await worker.recognize(firstImage, { rotateAuto: true }, { text: true });
+  const firstResult = await worker.recognize(firstImage, { rotateAuto: true }, { text: true, blocks: true, tsv: true });
+  const firstStructuredText = extractTargetColumnText(firstResult.data);
   let best = {
-    text: firstResult.data.text.trim(),
-    score: scoreOcrText(firstResult.data.text, firstResult.data.confidence),
+    text: firstStructuredText,
+    score: scoreCandidateText(firstStructuredText, firstResult.data),
   };
 
   if (best.score < 80) {
     for (const rotation of [90, 180, 270]) {
       onProgress(`OCR実行中 ${rotation}度`);
       const rotatedImage = await prepareImageForOcr(file, rotation);
-      const result = await worker.recognize(rotatedImage, { rotateAuto: true }, { text: true });
-      const text = result.data.text.trim();
-      const score = scoreOcrText(text, result.data.confidence);
-      if (score > best.score) best = { text, score };
+      const result = await worker.recognize(rotatedImage, { rotateAuto: true }, { text: true, blocks: true, tsv: true });
+      const structuredText = extractTargetColumnText(result.data);
+      const score = scoreCandidateText(structuredText, result.data);
+      if (score > best.score) best = { text: structuredText, score };
     }
   }
 
   return best.text;
+}
+
+function extractTargetColumnText(page: OcrPage) {
+  const fromTsv = extractTargetRowsFromTsv(page.tsv ?? "");
+  if (fromTsv.length > 0) return fromTsv.join("\n");
+
+  const fromLines = extractTargetRowsFromLines(page);
+  if (fromLines.length > 0) return fromLines.join("\n");
+
+  return "";
+}
+
+function extractTargetRowsFromTsv(tsv: string) {
+  const words = parseTsvWords(tsv);
+  if (words.length === 0) return [];
+  const headers = findHeaderCenters(words);
+  if (!headers) return [];
+
+  const rowWords = words.filter((word) => word.top > headers.headerBottom + 2 && word.conf > 20);
+  const rows = groupWordsByLine(rowWords);
+  return rows
+    .map((row) => {
+      const fields = { teacher: "", student: "", grade: "" };
+      for (const word of row) {
+        const center = word.left + word.width / 2;
+        const nearest = nearestColumn(center, headers.centers);
+        if (nearest) fields[nearest] = `${fields[nearest]} ${word.text}`.trim();
+      }
+      const parsed = parseDataLine(`${fields.teacher} ${fields.student} ${fields.grade}`);
+      return isValidParsedRow(parsed) ? `${cleanOcrName(parsed.teacherName)} ${cleanOcrName(parsed.studentName)} ${parsed.grade}` : "";
+    })
+    .filter(Boolean);
+}
+
+function parseTsvWords(tsv: string): OcrWord[] {
+  const lines = tsv.split(/\r?\n/).filter(Boolean);
+  const [header, ...items] = lines;
+  const columns = header?.split("\t") ?? [];
+  const columnIndex = (name: string) => columns.indexOf(name);
+  const levelIndex = columnIndex("level");
+  const leftIndex = columnIndex("left");
+  const topIndex = columnIndex("top");
+  const widthIndex = columnIndex("width");
+  const heightIndex = columnIndex("height");
+  const confIndex = columnIndex("conf");
+  const textIndex = columnIndex("text");
+  if ([levelIndex, leftIndex, topIndex, widthIndex, heightIndex, confIndex, textIndex].some((index) => index < 0)) return [];
+
+  return items.flatMap((line) => {
+    const values = line.split("\t");
+    const text = (values[textIndex] ?? "").trim();
+    if (values[levelIndex] !== "5" || !text) return [];
+    return [{
+      text,
+      left: Number(values[leftIndex]),
+      top: Number(values[topIndex]),
+      width: Number(values[widthIndex]),
+      height: Number(values[heightIndex]),
+      conf: Number(values[confIndex]),
+    }];
+  });
+}
+
+function findHeaderCenters(words: OcrWord[]) {
+  const candidates = words.filter((word) => /担当|講師|先生|会員|氏名|生徒|学年/.test(word.text));
+  if (candidates.length < 2) return undefined;
+  const teacherWords = candidates.filter((word) => /担当|講師|先生/.test(word.text));
+  const studentWords = candidates.filter((word) => /会員|氏名|生徒/.test(word.text));
+  const gradeWords = candidates.filter((word) => /学年/.test(word.text));
+  if (teacherWords.length === 0 || studentWords.length === 0 || gradeWords.length === 0) return undefined;
+  const centerOf = (items: OcrWord[]) => items.reduce((sum, word) => sum + word.left + word.width / 2, 0) / items.length;
+  const headerBottom = Math.max(...candidates.map((word) => word.top + word.height));
+  return {
+    headerBottom,
+    centers: {
+      teacher: centerOf(teacherWords),
+      student: centerOf(studentWords),
+      grade: centerOf(gradeWords),
+    },
+  };
+}
+
+function groupWordsByLine(words: OcrWord[]) {
+  const sorted = [...words].sort((a, b) => a.top - b.top || a.left - b.left);
+  const rows: OcrWord[][] = [];
+  for (const word of sorted) {
+    const row = rows.find((items) => {
+      const averageTop = items.reduce((sum, item) => sum + item.top, 0) / items.length;
+      return Math.abs(averageTop - word.top) <= Math.max(10, word.height * 0.8);
+    });
+    if (row) row.push(word);
+    else rows.push([word]);
+  }
+  return rows.map((row) => row.sort((a, b) => a.left - b.left));
+}
+
+function nearestColumn(center: number, centers: { teacher: number; student: number; grade: number }) {
+  const distances = [
+    ["teacher", Math.abs(center - centers.teacher)] as const,
+    ["student", Math.abs(center - centers.student)] as const,
+    ["grade", Math.abs(center - centers.grade)] as const,
+  ].sort((a, b) => a[1] - b[1]);
+  return distances[0][0];
+}
+
+function extractTargetRowsFromLines(page: OcrPage) {
+  const linesFromBlocks = page.blocks?.flatMap((block) => block.paragraphs?.flatMap((paragraph) => paragraph.lines ?? []) ?? []) ?? [];
+  const lines = linesFromBlocks.length > 0 ? linesFromBlocks.map((line) => line.text) : page.text.split(/\r?\n/);
+  return lines
+    .map((line) => ({ line, parsed: parseDataLine(line) }))
+    .filter(({ parsed }) => isValidParsedRow(parsed))
+    .map(({ parsed }) => `${cleanOcrName(parsed.teacherName)} ${cleanOcrName(parsed.studentName)} ${parsed.grade}`);
 }
 
 async function getOcrWorker() {
@@ -629,6 +780,11 @@ function scoreOcrText(text: string, confidence = 0) {
   const gradeHits = (text.match(/小[1-6]|中[1-3]|高[1-3]|小学[1-6]年/g) ?? []).length;
   const lineHits = text.split(/\r?\n/).filter((line) => line.trim().split(/[\s　\t]+/).length >= 2).length;
   return usefulChars + gradeHits * 15 + lineHits * 10 + confidence * 0.25;
+}
+
+function scoreCandidateText(structuredText: string, page: OcrPage) {
+  if (structuredText.trim()) return scoreOcrText(structuredText, page.confidence) + 1000;
+  return scoreOcrText(page.text, page.confidence) * 0.1;
 }
 
 function classNames(...values: Array<string | false | undefined>) {
@@ -729,6 +885,26 @@ export default function Home() {
     }));
   }
 
+  function resetAllData() {
+    if (!window.confirm("すべての画像・OCR行・手動調整・設定をリセットしますか？")) return;
+    Object.values(images).forEach((periodImages) => {
+      sourceTabs.forEach((source) => {
+        const image = periodImages[source];
+        if (image) URL.revokeObjectURL(image.previewUrl);
+      });
+    });
+    setActiveScreen("upload");
+    setSelectedPeriod(1);
+    setSelectedSource(1);
+    setRows([]);
+    setImages({});
+    setRawOcrTexts({});
+    setConfig(defaultBuildingConfig);
+    setAssignmentOverrides({});
+    setOcrBusy(false);
+    setOcrStatus("");
+  }
+
   async function runOcr() {
     setOcrBusy(true);
     setOcrStatus("OCRを開始しています");
@@ -754,7 +930,7 @@ export default function Home() {
       ]);
       setSelectedSource(1);
       setActiveScreen("ocr");
-      setOcrStatus("OCR完了");
+      setOcrStatus(results.length > 0 ? "OCR完了" : "担当講師名・会員氏名・学年の列を認識できませんでした");
     } catch (error) {
       setOcrStatus(error instanceof Error ? `OCRに失敗しました: ${error.message}` : "OCRに失敗しました");
     } finally {
@@ -765,11 +941,19 @@ export default function Home() {
   return (
     <main className="mx-auto flex min-h-[100dvh] max-w-md flex-col bg-white shadow-[0_0_0_1px_rgba(37,99,235,0.08)]">
       <header className="sticky top-0 z-10 border-b border-line bg-white/95 px-4 py-3 backdrop-blur">
-        <div>
+        <div className="flex items-start justify-between gap-3">
           <div>
             <p className="text-xs font-bold text-appblue">配置</p>
             <h1 className="text-lg font-bold tracking-normal">{selectedTitle}</h1>
           </div>
+          <button
+            type="button"
+            onClick={resetAllData}
+            disabled={ocrBusy}
+            className="text-keep shrink-0 whitespace-nowrap rounded-md border border-red-200 bg-white px-3 py-2 text-xs font-bold leading-none text-red-600 disabled:opacity-50 active:translate-y-px"
+          >
+            リセット
+          </button>
         </div>
         <div className="scrollbar-none mt-3 flex gap-2 overflow-x-auto">
           {screens.map((screen) => (
