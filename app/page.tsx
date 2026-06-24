@@ -87,6 +87,12 @@ type UploadedImage = {
 
 type ScreenId = "upload" | "ocr" | "seating" | "teachers" | "students" | "warnings" | "settings";
 
+type DiagramPerson = {
+  key: string;
+  name: string;
+  grade?: string;
+};
+
 const periods = [1, 2, 3, 4, 5, 6, 7, 8];
 const sourceTabs: Array<1 | 2> = [1, 2];
 
@@ -113,25 +119,7 @@ const mainSeatLayout = [
 
 const mainSeatOrder = [1, 4, 7, 2, 5, 8, 3, 10, 12, 14, 9, 11, 13, 6];
 
-const initialRows: RawRow[] = [
-  { id: "r1", period: 1, sourceImageIndex: 1, teacherName: "佐藤 光一", studentName: "山田 太郎", grade: "小5" },
-  { id: "r2", period: 1, sourceImageIndex: 1, teacherName: "田中 裕二", studentName: "鈴木 花子", grade: "中2" },
-  { id: "r3", period: 2, sourceImageIndex: 1, teacherName: "佐藤 光一", studentName: "山田 太郎", grade: "小5" },
-  { id: "r4", period: 2, sourceImageIndex: 2, teacherName: "鈴木 美咲", studentName: "高橋 一郎", grade: "小3" },
-  { id: "r5", period: 3, sourceImageIndex: 1, teacherName: "伊藤 直樹", studentName: "森 健太", grade: "高1" },
-  { id: "r6", period: 3, sourceImageIndex: 1, teacherName: "中村 綾", studentName: "小林 真央", grade: "中3" },
-  { id: "r7", period: 4, sourceImageIndex: 1, teacherName: "田中 裕二", studentName: "鈴木 花子", grade: "中2" },
-  { id: "r8", period: 4, sourceImageIndex: 2, teacherName: "鈴木 美咲", studentName: "渡辺 悠斗", grade: "小6" },
-];
-
-const rawTextSamples: Record<string, string> = {
-  "1-1": "講師　生徒　学年　補足1\n佐藤 光一　山田 太郎　小5　なし\n田中 裕二　鈴木 花子　中2　なし",
-  "2-1": "講師　生徒　学年　補足1\n佐藤 光一　山田 太郎　小5　なし",
-  "2-2": "講師　生徒　学年　補足1\n鈴木 美咲　高橋 一郎　小3　なし",
-  "3-1": "担当講師　生徒　学年　補足\n伊藤 直樹　森 健太　高1　なし\n中村 綾　小林 真央　中3　なし",
-  "4-1": "先生　生徒　学年\n田中 裕二　鈴木 花子　中2",
-  "4-2": "講師　生徒　学年\n鈴木 美咲　渡辺 悠斗　小6",
-};
+const initialRows: RawRow[] = [];
 
 function sourceKey(period: number, sourceImageIndex: 1 | 2) {
   return `${period}-${sourceImageIndex}`;
@@ -515,11 +503,8 @@ function parseDataLine(line: string) {
 }
 
 async function runOcrPlaceholder(period: number, sourceImageIndex: 1 | 2, rawText?: string): Promise<RawRow[]> {
-  const sample = rawText?.trim()
-    ? rawText
-    : rawTextSamples[sourceKey(period, sourceImageIndex)] ??
-    `講師　生徒　学年\n仮 講師${period}${sourceImageIndex}　仮 生徒${period}${sourceImageIndex}　中1`;
-  return parseOcrText(sample, period, sourceImageIndex);
+  if (!rawText?.trim()) return [];
+  return parseOcrText(rawText, period, sourceImageIndex);
 }
 
 function classNames(...values: Array<string | false | undefined>) {
@@ -532,7 +517,7 @@ export default function Home() {
   const [selectedSource, setSelectedSource] = useState<1 | 2>(1);
   const [rows, setRows] = useState<RawRow[]>(initialRows);
   const [images, setImages] = useState<Record<number, Partial<Record<1 | 2, UploadedImage>>>>({});
-  const [rawOcrTexts, setRawOcrTexts] = useState<Record<string, string>>({ ...rawTextSamples });
+  const [rawOcrTexts, setRawOcrTexts] = useState<Record<string, string>>({});
   const [config, setConfig] = useState<BuildingConfig>(defaultBuildingConfig);
   const [assignmentOverrides, setAssignmentOverrides] = useState<Record<string, AssignmentOverride>>({});
   const [ocrBusy, setOcrBusy] = useState(false);
@@ -638,13 +623,10 @@ export default function Home() {
   return (
     <main className="mx-auto flex min-h-[100dvh] max-w-md flex-col bg-white shadow-[0_0_0_1px_rgba(37,99,235,0.08)]">
       <header className="sticky top-0 z-10 border-b border-line bg-white/95 px-4 py-3 backdrop-blur">
-        <div className="flex items-center justify-between gap-3">
+        <div>
           <div>
             <p className="text-xs font-bold text-appblue">塾 座席割り振り</p>
             <h1 className="text-lg font-bold tracking-normal">{selectedTitle}</h1>
-          </div>
-          <div className="rounded-md border border-line px-2 py-1 text-xs font-bold text-slate-600">
-            {rows.length} 行
           </div>
         </div>
         <div className="scrollbar-none mt-3 flex gap-2 overflow-x-auto">
@@ -1085,12 +1067,14 @@ function RemoteBuilding({ title, assignments, color }: { title: string; assignme
 }
 
 function DiagramScreen({ mode, assignments }: { mode: "teachers" | "students"; assignments: Assignment[] }) {
-  const people = useMemo(() => {
-    if (mode === "teachers") return Array.from(new Set(assignments.map((assignment) => assignment.teacherName))).map((name) => ({ key: name, label: name }));
-    const studentMap = new Map<string, { key: string; label: string }>();
+  const people = useMemo<DiagramPerson[]>(() => {
+    if (mode === "teachers") {
+      return Array.from(new Set(assignments.map((assignment) => assignment.teacherName))).map((name) => ({ key: name, name }));
+    }
+    const studentMap = new Map<string, DiagramPerson>();
     for (const assignment of assignments) {
       for (const student of assignment.students) {
-        studentMap.set(student.name, { key: student.name, label: student.isElementary ? `${student.name}\n${student.grade}` : student.name });
+        studentMap.set(student.name, { key: student.name, name: student.name, grade: student.isElementary ? student.grade : undefined });
       }
     }
     return Array.from(studentMap.values());
@@ -1100,12 +1084,16 @@ function DiagramScreen({ mode, assignments }: { mode: "teachers" | "students"; a
     return assignments.find((assignment) => assignment.period === period && (mode === "teachers" ? assignment.teacherName === personKey : assignment.students.some((student) => student.name === personKey)));
   }
 
+  if (people.length === 0) {
+    return <EmptyState text={mode === "teachers" ? "講師データはまだありません" : "生徒データはまだありません"} />;
+  }
+
   return (
     <div className="overflow-x-auto rounded-md border border-line">
-      <table className="min-w-[780px] border-collapse text-left text-xs">
+      <table className="min-w-[860px] border-collapse text-left text-xs">
         <thead>
           <tr className="bg-slate-50">
-            <th className="sticky left-0 z-[1] w-32 border-b border-line bg-slate-50 p-2">対象</th>
+            <th className="sticky left-0 z-[1] w-44 min-w-44 border-b border-line bg-slate-50 p-2">対象</th>
             {periods.map((period) => (
               <th key={period} className="border-b border-line p-2 text-center">{period}コマ</th>
             ))}
@@ -1114,7 +1102,10 @@ function DiagramScreen({ mode, assignments }: { mode: "teachers" | "students"; a
         <tbody>
           {people.map((person) => (
             <tr key={person.key}>
-              <th className="sticky left-0 z-[1] whitespace-pre-line border-b border-line bg-white p-2 font-bold">{person.label}</th>
+              <th className="sticky left-0 z-[1] w-44 min-w-44 border-b border-line bg-white p-2 text-left">
+                <div className="text-keep whitespace-nowrap text-sm font-bold leading-tight">{person.name}</div>
+                {person.grade && <div className="mt-1 text-xs font-bold text-slate-500">{person.grade}</div>}
+              </th>
               {periods.map((period) => {
                 const assignment = findAssignment(person.key, period);
                 return (
