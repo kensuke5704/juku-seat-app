@@ -133,6 +133,10 @@ const rawTextSamples: Record<string, string> = {
   "4-2": "講師　生徒　学年\n鈴木 美咲　渡辺 悠斗　小6",
 };
 
+function sourceKey(period: number, sourceImageIndex: 1 | 2) {
+  return `${period}-${sourceImageIndex}`;
+}
+
 const screens: Array<{ id: ScreenId; label: string; short: string }> = [
   { id: "upload", label: "画像アップロード", short: "画像" },
   { id: "ocr", label: "OCR確認", short: "OCR" },
@@ -510,9 +514,10 @@ function parseDataLine(line: string) {
   };
 }
 
-async function runOcrPlaceholder(period: number, sourceImageIndex: 1 | 2): Promise<RawRow[]> {
-  const sample =
-    rawTextSamples[`${period}-${sourceImageIndex}`] ??
+async function runOcrPlaceholder(period: number, sourceImageIndex: 1 | 2, rawText?: string): Promise<RawRow[]> {
+  const sample = rawText?.trim()
+    ? rawText
+    : rawTextSamples[sourceKey(period, sourceImageIndex)] ??
     `講師　生徒　学年\n仮 講師${period}${sourceImageIndex}　仮 生徒${period}${sourceImageIndex}　中1`;
   return parseOcrText(sample, period, sourceImageIndex);
 }
@@ -527,6 +532,7 @@ export default function Home() {
   const [selectedSource, setSelectedSource] = useState<1 | 2>(1);
   const [rows, setRows] = useState<RawRow[]>(initialRows);
   const [images, setImages] = useState<Record<number, Partial<Record<1 | 2, UploadedImage>>>>({});
+  const [rawOcrTexts, setRawOcrTexts] = useState<Record<string, string>>({ ...rawTextSamples });
   const [config, setConfig] = useState<BuildingConfig>(defaultBuildingConfig);
   const [assignmentOverrides, setAssignmentOverrides] = useState<Record<string, AssignmentOverride>>({});
   const [ocrBusy, setOcrBusy] = useState(false);
@@ -561,6 +567,21 @@ export default function Home() {
 
   function deleteRow(id: string) {
     setRows((current) => current.filter((row) => row.id !== id));
+  }
+
+  function updateRawOcrText(period: number, source: 1 | 2, value: string) {
+    setRawOcrTexts((current) => ({
+      ...current,
+      [sourceKey(period, source)]: value,
+    }));
+  }
+
+  function importRowsFromText(period: number, source: 1 | 2) {
+    const parsedRows = parseOcrText(rawOcrTexts[sourceKey(period, source)] ?? "", period, source);
+    setRows((current) => [
+      ...current.filter((row) => !(row.period === period && row.sourceImageIndex === source)),
+      ...parsedRows,
+    ]);
   }
 
   function updateAssignmentOverride(lessonId: string, override?: AssignmentOverride) {
@@ -599,8 +620,11 @@ export default function Home() {
 
   async function runOcr() {
     setOcrBusy(true);
-    const result1 = await runOcrPlaceholder(selectedPeriod, 1);
-    const result2 = images[selectedPeriod]?.[2] ? await runOcrPlaceholder(selectedPeriod, 2) : [];
+    const result1 = await runOcrPlaceholder(selectedPeriod, 1, rawOcrTexts[sourceKey(selectedPeriod, 1)]);
+    const result2 =
+      images[selectedPeriod]?.[2] || rawOcrTexts[sourceKey(selectedPeriod, 2)]?.trim()
+        ? await runOcrPlaceholder(selectedPeriod, 2, rawOcrTexts[sourceKey(selectedPeriod, 2)])
+        : [];
     setRows((current) => [
       ...current.filter((row) => row.period !== selectedPeriod),
       ...result1,
@@ -630,7 +654,7 @@ export default function Home() {
               type="button"
               onClick={() => setActiveScreen(screen.id)}
               className={classNames(
-                "shrink-0 rounded-md border px-3 py-2 text-sm font-bold transition active:translate-y-px",
+                "text-keep shrink-0 whitespace-nowrap rounded-md border px-3 py-2 text-sm font-bold leading-none transition active:translate-y-px",
                 activeScreen === screen.id
                   ? "border-appblue bg-appblue text-white"
                   : "border-line bg-white text-slate-600",
@@ -662,6 +686,9 @@ export default function Home() {
             setSelectedSource={setSelectedSource}
             selectedRows={selectedRows}
             periodLessons={lessons.filter((lesson) => lesson.period === selectedPeriod)}
+            rawText={rawOcrTexts[sourceKey(selectedPeriod, selectedSource)] ?? ""}
+            setRawText={(value) => updateRawOcrText(selectedPeriod, selectedSource, value)}
+            importRowsFromText={() => importRowsFromText(selectedPeriod, selectedSource)}
             teacherNames={teacherNames}
             updateRow={updateRow}
             deleteRow={deleteRow}
@@ -698,7 +725,7 @@ function PeriodPicker({ selectedPeriod, onChange }: { selectedPeriod: number; on
           type="button"
           onClick={() => onChange(period)}
           className={classNames(
-            "h-10 min-w-12 rounded-md border px-3 text-sm font-bold active:translate-y-px",
+            "text-keep h-10 min-w-[58px] shrink-0 whitespace-nowrap rounded-md border px-3 text-sm font-bold leading-none active:translate-y-px",
             selectedPeriod === period ? "border-appblue bg-blue-50 text-appblue" : "border-line bg-white text-slate-600",
           )}
         >
@@ -784,6 +811,9 @@ function OcrScreen(props: {
   setSelectedSource: (source: 1 | 2) => void;
   selectedRows: RawRow[];
   periodLessons: Lesson[];
+  rawText: string;
+  setRawText: (value: string) => void;
+  importRowsFromText: () => void;
   teacherNames: string[];
   updateRow: (id: string, key: keyof RawRow, value: string) => void;
   deleteRow: (id: string) => void;
@@ -811,8 +841,13 @@ function OcrScreen(props: {
       </datalist>
       <div className="space-y-3">
         {props.selectedRows.map((row) => (
-          <div key={row.id} className="rounded-md border border-line p-3">
-            <div className="grid gap-3">
+          <div key={row.id} className="rounded-md border border-line p-2.5">
+            <div className="mb-2 flex justify-end">
+              <button type="button" onClick={() => props.deleteRow(row.id)} className="text-keep whitespace-nowrap rounded-md border border-red-200 px-3 py-1.5 text-sm font-bold leading-none text-red-600 active:translate-y-px">
+                削除
+              </button>
+            </div>
+            <div className="grid gap-2">
               <Field label="講師">
                 <input list="teacher-candidates" value={row.teacherName} onChange={(event) => props.updateRow(row.id, "teacherName", event.target.value)} className="input" />
               </Field>
@@ -823,11 +858,6 @@ function OcrScreen(props: {
                 <input value={row.grade ?? ""} onChange={(event) => props.updateRow(row.id, "grade", event.target.value)} className="input" />
               </Field>
             </div>
-            <div className="mt-3 flex justify-end">
-              <button type="button" onClick={() => props.deleteRow(row.id)} className="rounded-md border border-red-200 px-3 py-2 text-sm font-bold text-red-600 active:translate-y-px">
-                削除
-              </button>
-            </div>
           </div>
         ))}
       </div>
@@ -837,9 +867,20 @@ function OcrScreen(props: {
       </button>
       <details className="rounded-md border border-line bg-slate-50 p-3">
         <summary className="cursor-pointer font-bold">元OCRテキスト</summary>
-        <pre className="mt-3 whitespace-pre-wrap rounded-md bg-white p-3 text-xs text-slate-600">
-          {rawTextSamples[`${props.selectedPeriod}-${props.selectedSource}`] ?? "OCRテキストは未取得です"}
-        </pre>
+        <div className="mt-3 grid gap-3">
+          <textarea
+            className="input min-h-40 text-xs"
+            value={props.rawText}
+            onChange={(event) => props.setRawText(event.target.value)}
+          />
+          <button
+            type="button"
+            onClick={props.importRowsFromText}
+            className="rounded-md bg-appblue px-4 py-3 text-sm font-bold text-white active:translate-y-px"
+          >
+            このテキストから取り込み
+          </button>
+        </div>
       </details>
       <div className="rounded-md border border-line p-3">
         <SectionTitle title={`${props.selectedPeriod}コマの統合プレビュー`} />
@@ -906,9 +947,9 @@ function SeatingScreen(props: {
               if (!seat) return <div key={`${rowIndex}-${colIndex}`} />;
               const assignment = bySeat.get(seat);
               return (
-                <div key={seat} className="min-h-16 rounded-md border border-blue-200 bg-white p-2">
+                  <div key={seat} className="min-h-16 rounded-md border border-blue-200 bg-white p-1.5">
                   <div className="text-[10px] font-bold text-blue-500">{seat}</div>
-                  <div className="mt-1 text-sm font-bold leading-tight">{assignment?.teacherName ?? ""}</div>
+                  <div className="text-keep mt-2 whitespace-nowrap text-[11px] font-bold leading-none tracking-normal">{assignment?.teacherName ?? ""}</div>
                 </div>
               );
             }),
@@ -1122,8 +1163,10 @@ function WarningsScreen({ warnings, assignments }: { warnings: SeatingWarning[];
   return (
     <div className="space-y-3">
       <div className="rounded-md border border-line p-3">
-        <SectionTitle title="出力" />
-        <div className="grid grid-cols-2 gap-2">
+        <div className="no-print">
+          <SectionTitle title="出力" />
+        </div>
+        <div className="no-print grid grid-cols-2 gap-2">
           <button type="button" onClick={copyOutput} className="rounded-md bg-appblue px-3 py-3 text-sm font-bold text-white active:translate-y-px">
             {copied ? "コピー済み" : "テキストコピー"}
           </button>
@@ -1131,7 +1174,7 @@ function WarningsScreen({ warnings, assignments }: { warnings: SeatingWarning[];
             印刷
           </button>
         </div>
-        <textarea className="input mt-3 min-h-32 text-xs" value={outputText} readOnly />
+        <textarea className="input mt-3 min-h-32 text-xs" value={outputText} readOnly aria-label="出力テキスト" />
       </div>
       {warnings.map((warning) => (
         <div key={warning.id} className="rounded-md border border-amber-200 bg-amber-50 p-3">

@@ -53,3 +53,37 @@ button {
   border-color: #2563eb;
   box-shadow: 0 0 0 3px rgb(37 99 235 / 0.12);
 }
+
+.text-keep {
+  word-break: keep-all;
+  overflow-wrap: normal;
+}
+
+@media print {
+  body {
+    background: #ffffff;
+  }
+
+  header,
+  button,
+  .no-print {
+    display: none !important;
+  }
+
+  main {
+    max-width: none !important;
+    min-height: auto !important;
+    box-shadow: none !important;
+  }
+
+  section {
+    padding: 0 !important;
+  }
+
+  textarea {
+    min-height: 90vh !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    font-size: 12px !important;
+  }
+}
