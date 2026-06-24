@@ -59,6 +59,11 @@ type Assignment = {
   warningMessages?: string[];
 };
 
+type AssignmentOverride = {
+  buildingId: BuildingId;
+  seatNumber: number;
+};
+
 type SeatingWarning = {
   id: string;
   period: number;
@@ -106,6 +111,8 @@ const mainSeatLayout = [
   ["H-13", "H-11", null, "H-09"],
 ];
 
+const mainSeatOrder = [1, 4, 7, 2, 5, 8, 3, 10, 12, 14, 9, 11, 13, 6];
+
 const initialRows: RawRow[] = [
   { id: "r1", period: 1, sourceImageIndex: 1, teacherName: "佐藤 光一", studentName: "山田 太郎", grade: "小5" },
   { id: "r2", period: 1, sourceImageIndex: 1, teacherName: "田中 裕二", studentName: "鈴木 花子", grade: "中2" },
@@ -141,83 +148,321 @@ function isElementaryGrade(grade?: string) {
   return /^(小[1-6]|小学生|小学[1-6]年)$/.test(grade.trim());
 }
 
+function buildingName(buildingId: BuildingId) {
+  return buildings.find((building) => building.id === buildingId)?.name ?? "本館";
+}
+
+function seatLabel(buildingId: BuildingId, seatNumber: number) {
+  const prefix = buildingId === "main" ? "H" : buildingId === "building2" ? "2" : "3";
+  return `${prefix}-${String(seatNumber).padStart(2, "0")}`;
+}
+
+function maxTeachersForBuilding(buildingId: BuildingId, config: BuildingConfig) {
+  if (buildingId === "main") return config.mainMaxTeachers;
+  if (buildingId === "building2") return config.building2MaxTeachers;
+  return config.building3MaxTeachers;
+}
+
 function rowsToLessons(rows: RawRow[]): Lesson[] {
   const groups = new Map<string, RawRow[]>();
   for (const row of rows) {
-    const key = `${row.period}:${row.teacherName}`;
+    const teacherName = row.teacherName.trim();
+    const key = `${row.period}:${teacherName || row.id}`;
     groups.set(key, [...(groups.get(key) ?? []), row]);
   }
   return Array.from(groups.values()).map((items) => {
-    const students = items.map((item) => ({
-      name: item.studentName,
-      grade: item.grade,
-      isElementary: isElementaryGrade(item.grade),
-    }));
+    const students = items.map((item) => {
+      const grade = item.grade?.trim();
+      return {
+        name: item.studentName.trim(),
+        grade,
+        isElementary: isElementaryGrade(grade),
+      };
+    });
     return {
-      id: `lesson-${items[0].period}-${items[0].teacherName}`,
+      id: `lesson-${items[0].period}-${items[0].teacherName.trim() || items[0].id}`,
       period: items[0].period,
-      teacherName: items[0].teacherName,
+      teacherName: items[0].teacherName.trim(),
       students,
       hasElementaryStudent: students.some((student) => student.isElementary),
     };
   });
 }
 
-function createAssignments(lessons: Lesson[]): Assignment[] {
-  const seatCursors: Record<number, number> = {};
-  return lessons.map((lesson, index) => {
-    const cursor = seatCursors[lesson.period] ?? 0;
-    seatCursors[lesson.period] = cursor + 1;
-    const forceRemote = lesson.teacherName === "鈴木 美咲" && lesson.period === 4;
-    const building = forceRemote ? buildings[1] : cursor < 3 ? buildings[0] : buildings[cursor % 2 === 0 ? 1 : 2];
-    const seatNumber = building.id === "main" ? [1, 4, 7, 10, 13][cursor] ?? cursor + 1 : cursor + 1;
-    const prefix = building.id === "main" ? "H" : building.id === "building2" ? "2" : "3";
-    return {
-      id: `a-${lesson.id}`,
-      lessonId: lesson.id,
-      period: lesson.period,
-      buildingId: building.id,
-      buildingName: building.name,
-      seatNumber,
-      seatLabel: `${prefix}-${String(seatNumber).padStart(2, "0")}`,
-      teacherName: lesson.teacherName,
-      students: lesson.students,
-      hasElementaryStudent: lesson.hasElementaryStudent,
-      status: forceRemote ? "warning" : index % 3 === 0 ? "continued" : "normal",
-      warningMessages: forceRemote ? ["小学生を含む授業が本館以外に配置されています"] : undefined,
-    };
-  });
+function canUseBuildingAfterPrevious(previous: Assignment | undefined, buildingId: BuildingId) {
+  if (!previous) return true;
+  if (previous.period + 1 < 1) return true;
+  if (previous.buildingId === buildingId) return true;
+  return previous.buildingId === "main" && (buildingId === "building2" || buildingId === "building3");
 }
 
-function createWarnings(rows: RawRow[], assignments: Assignment[]): SeatingWarning[] {
-  const warnings: SeatingWarning[] = assignments
-    .filter((assignment) => assignment.hasElementaryStudent && assignment.buildingId !== "main")
-    .map((assignment) => ({
-      id: `w-${assignment.id}`,
-      period: assignment.period,
-      type: "elementary_not_in_main",
-      target: assignment.teacherName,
-      message: "小学生を含む授業が本館以外に配置されています",
-    }));
-  for (const lesson of rowsToLessons(rows)) {
+function findPreviousAssignment(lesson: Lesson, assignments: Assignment[]) {
+  return assignments.find(
+    (assignment) =>
+      assignment.period === lesson.period - 1 &&
+      (assignment.teacherName === lesson.teacherName ||
+        lesson.students.some((student) => assignment.students.some((assignedStudent) => assignedStudent.name === student.name))),
+  );
+}
+
+function createAssignments(lessons: Lesson[], config: BuildingConfig, overrides: Record<string, AssignmentOverride>): Assignment[] {
+  const assignments: Assignment[] = [];
+
+  for (const period of periods) {
+    const periodLessons = lessons
+      .filter((lesson) => lesson.period === period)
+      .filter((lesson) => lesson.teacherName && lesson.students.every((student) => student.name) && lesson.students.length <= 2)
+      .sort((a, b) => Number(b.hasElementaryStudent) - Number(a.hasElementaryStudent) || a.teacherName.localeCompare(b.teacherName, "ja"));
+
+    const usedSeats: Record<BuildingId, Set<number>> = {
+      main: new Set(),
+      building2: new Set(),
+      building3: new Set(),
+    };
+
+    for (const lesson of periodLessons) {
+      const previous = findPreviousAssignment(lesson, assignments);
+      const override = overrides[lesson.id];
+      const baseOrder: BuildingId[] = lesson.hasElementaryStudent ? ["main", "building2", "building3"] : ["main", "building2", "building3"];
+      const preferredOrder = previous ? [previous.buildingId, ...baseOrder.filter((id) => id !== previous.buildingId)] : baseOrder;
+      const buildingOrder = override ? [override.buildingId, ...preferredOrder.filter((id) => id !== override.buildingId)] : preferredOrder;
+      let placed: Assignment | undefined;
+
+      for (const buildingId of buildingOrder) {
+        if (!canUseBuildingAfterPrevious(previous, buildingId)) continue;
+        if (usedSeats[buildingId].size >= maxTeachersForBuilding(buildingId, config)) continue;
+
+        const seatCandidates =
+          buildingId === "main"
+            ? [
+                ...(override?.buildingId === buildingId ? [override.seatNumber] : []),
+                ...(previous?.buildingId === "main" ? [previous.seatNumber] : []),
+                ...mainSeatOrder,
+              ]
+            : [
+                ...(override?.buildingId === buildingId ? [override.seatNumber] : []),
+                ...Array.from({ length: maxTeachersForBuilding(buildingId, config) }, (_, index) => index + 1),
+              ];
+        const seatNumber = seatCandidates.find((candidate) => !usedSeats[buildingId].has(candidate));
+        if (!seatNumber) continue;
+
+        usedSeats[buildingId].add(seatNumber);
+        placed = {
+          id: `a-${lesson.id}`,
+          lessonId: lesson.id,
+          period: lesson.period,
+          buildingId,
+          buildingName: buildingName(buildingId),
+          seatNumber,
+          seatLabel: seatLabel(buildingId, seatNumber),
+          teacherName: lesson.teacherName,
+          students: lesson.students,
+          hasElementaryStudent: lesson.hasElementaryStudent,
+          status:
+            override?.buildingId === buildingId && override.seatNumber === seatNumber
+              ? "normal"
+              : previous?.buildingId === buildingId && previous?.seatNumber === seatNumber
+                ? "continued"
+                : previous
+                  ? "allowed_move"
+                  : "normal",
+          moveLabel: previous && previous.buildingId !== buildingId ? `${previous.buildingName} → ${buildingName(buildingId)}` : undefined,
+        };
+        break;
+      }
+
+      if (placed) assignments.push(placed);
+    }
+  }
+
+  return assignments;
+}
+
+function createWarnings(rows: RawRow[], lessons: Lesson[], assignments: Assignment[], config: BuildingConfig): SeatingWarning[] {
+  const warnings: SeatingWarning[] = [];
+  const assignmentsByLessonId = new Map(assignments.map((assignment) => [assignment.lessonId, assignment]));
+
+  for (const row of rows) {
+    if (!row.teacherName.trim() || !row.studentName.trim()) {
+      warnings.push({
+        id: `w-blank-${row.id}`,
+        period: row.period,
+        type: "unassigned",
+        target: row.teacherName.trim() || row.studentName.trim() || "OCR行",
+        message: "講師名または生徒名が空欄です",
+      });
+    }
+  }
+
+  for (const period of periods) {
+    const periodRows = rows.filter((row) => row.period === period);
+    const students = new Map<string, number>();
+    const teachers = new Map<string, number>();
+
+    for (const row of periodRows) {
+      const teacherName = row.teacherName.trim();
+      const studentName = row.studentName.trim();
+      if (teacherName) teachers.set(teacherName, (teachers.get(teacherName) ?? 0) + 1);
+      if (studentName) students.set(studentName, (students.get(studentName) ?? 0) + 1);
+    }
+
+    for (const [studentName, count] of students.entries()) {
+      if (count >= 2) {
+        warnings.push({
+          id: `w-duplicate-student-${period}-${studentName}`,
+          period,
+          type: "duplicate_student",
+          target: studentName,
+          message: "同じコマで生徒が重複しています",
+        });
+      }
+    }
+
+    for (const [teacherName, count] of teachers.entries()) {
+      if (count >= 3) {
+        warnings.push({
+          id: `w-duplicate-teacher-${period}-${teacherName}`,
+          period,
+          type: "duplicate_teacher",
+          target: teacherName,
+          message: "同じコマで講師が重複している可能性があります",
+        });
+      }
+    }
+  }
+
+  for (const lesson of lessons) {
+    const assignment = assignmentsByLessonId.get(lesson.id);
     if (lesson.students.length >= 3) {
       warnings.push({
         id: `w-many-${lesson.id}`,
         period: lesson.period,
         type: "too_many_students",
         target: lesson.teacherName,
-        message: "同じ講師に生徒が3人以上います",
+        message: "同じコマ・同じ講師に生徒が3人以上います",
+      });
+    }
+    if (!assignment) {
+      warnings.push({
+        id: `w-unassigned-${lesson.id}`,
+        period: lesson.period,
+        type: "unassigned",
+        target: lesson.teacherName || "未入力",
+        message: "未配置の授業があります",
       });
     }
   }
-  warnings.push({
-    id: "w-move-sample",
-    period: 4,
-    type: "discouraged_move",
-    target: "田中 裕二",
-    message: "本館から2号館への移動があります",
-  });
+
+  for (const assignment of assignments) {
+    if (assignment.hasElementaryStudent && assignment.buildingId !== "main") {
+      warnings.push({
+        id: `w-elementary-${assignment.id}`,
+        period: assignment.period,
+        type: "elementary_not_in_main",
+        target: assignment.teacherName,
+        message: "小学生を含む授業が本館以外に配置されています",
+      });
+    }
+
+    const previous = findPreviousAssignment(
+      {
+        id: assignment.lessonId,
+        period: assignment.period,
+        teacherName: assignment.teacherName,
+        students: assignment.students,
+        hasElementaryStudent: assignment.hasElementaryStudent,
+      },
+      assignments,
+    );
+    if (previous && previous.buildingId !== assignment.buildingId) {
+      const allowed = previous.buildingId === "main" && (assignment.buildingId === "building2" || assignment.buildingId === "building3");
+      warnings.push({
+        id: `w-move-${assignment.id}`,
+        period: assignment.period,
+        type: allowed ? "discouraged_move" : "discouraged_move",
+        target: assignment.teacherName,
+        message: `${previous.buildingName}から${assignment.buildingName}への移動があります`,
+      });
+    }
+    if (previous?.buildingId === "main" && assignment.buildingId === "main" && previous.seatNumber !== assignment.seatNumber) {
+      warnings.push({
+        id: `w-seat-${assignment.id}`,
+        period: assignment.period,
+        type: "seat_changed_in_main",
+        target: assignment.teacherName,
+        message: "本館で連続コマなのに同じ座席を使えませんでした",
+      });
+    }
+  }
+
+  for (const period of periods) {
+    for (const building of buildings) {
+      const count = assignments.filter((assignment) => assignment.period === period && assignment.buildingId === building.id).length;
+      if (count > maxTeachersForBuilding(building.id, config)) {
+        warnings.push({
+          id: `w-capacity-${period}-${building.id}`,
+          period,
+          type: "capacity_exceeded",
+          target: building.name,
+          message: "建物ごとの最大人数を超えています",
+        });
+      }
+    }
+  }
+
   return warnings;
+}
+
+function createWarningsLabel(type: SeatingWarning["type"]) {
+  const labels: Record<SeatingWarning["type"], string> = {
+    duplicate_teacher: "講師重複",
+    duplicate_student: "生徒重複",
+    too_many_students: "生徒3人以上",
+    capacity_exceeded: "定員超過",
+    unassigned: "未配置",
+    discouraged_move: "建物移動",
+    seat_changed_in_main: "座席変更",
+    elementary_not_in_main: "小学生",
+  };
+  return labels[type];
+}
+
+function createUnassignedLessons(lessons: Lesson[], assignments: Assignment[]) {
+  const assignedIds = new Set(assignments.map((assignment) => assignment.lessonId));
+  return lessons.filter((lesson) => !assignedIds.has(lesson.id));
+}
+
+function getAssignmentSummary(assignments: Assignment[], warnings: SeatingWarning[]) {
+  return {
+    assignedCount: assignments.length,
+    warningCount: warnings.length,
+    unassignedCount: warnings.filter((warning) => warning.type === "unassigned").length,
+  };
+}
+
+function buildOutputText(assignments: Assignment[], warnings: SeatingWarning[]) {
+  const lines = ["塾 座席割り振り", ""];
+  for (const period of periods) {
+    const periodAssignments = assignments.filter((assignment) => assignment.period === period);
+    lines.push(`${period}コマ`);
+    if (periodAssignments.length === 0) {
+      lines.push("配置なし");
+    } else {
+      for (const assignment of periodAssignments) {
+        lines.push(`${assignment.buildingName} ${assignment.seatLabel} ${assignment.teacherName}`);
+      }
+    }
+    lines.push("");
+  }
+  lines.push("注意・警告");
+  if (warnings.length === 0) {
+    lines.push("なし");
+  } else {
+    for (const warning of warnings) {
+      lines.push(`${warning.period}コマ ${createWarningsLabel(warning.type)} ${warning.target ?? "全体"} ${warning.message}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 function parseOcrText(text: string, period: number, sourceImageIndex: 1 | 2): RawRow[] {
@@ -225,17 +470,44 @@ function parseOcrText(text: string, period: number, sourceImageIndex: 1 | 2): Ra
   const headerIndex = lines.findIndex((line) => /(講師|担当講師|先生)/.test(line) && line.includes("生徒") && line.includes("学年"));
   if (headerIndex < 0) return [];
   return lines.slice(headerIndex + 1).map((line, index) => {
-    const cols = line.split(/[\s　\t]+/).filter(Boolean);
+    const parsed = parseDataLine(line);
     return {
       id: `ocr-${period}-${sourceImageIndex}-${Date.now()}-${index}`,
       period,
       sourceImageIndex,
-      teacherName: `${cols[0] ?? ""} ${cols[1] ?? ""}`.trim(),
-      studentName: `${cols[2] ?? ""} ${cols[3] ?? ""}`.trim(),
-      grade: cols[4],
+      teacherName: parsed.teacherName,
+      studentName: parsed.studentName,
+      grade: parsed.grade,
       rawText: line,
     };
   });
+}
+
+function parseDataLine(line: string) {
+  const tokens = line.split(/[\s　\t]+/).filter(Boolean);
+  const gradeIndex = tokens.findIndex((token) => /^(小[1-6]|中[1-3]|高[1-3]|小学生|小学[1-6]年)$/.test(token));
+  const grade = gradeIndex >= 0 ? tokens[gradeIndex] : tokens[4];
+  const nameTokens = tokens.slice(0, gradeIndex >= 0 ? gradeIndex : 4);
+
+  if (nameTokens.length >= 4) {
+    return {
+      teacherName: nameTokens.slice(0, 2).join(" "),
+      studentName: nameTokens.slice(2).join(" "),
+      grade,
+    };
+  }
+  if (nameTokens.length === 3) {
+    return {
+      teacherName: nameTokens[0],
+      studentName: nameTokens.slice(1).join(" "),
+      grade,
+    };
+  }
+  return {
+    teacherName: nameTokens[0] ?? "",
+    studentName: nameTokens[1] ?? "",
+    grade,
+  };
 }
 
 async function runOcrPlaceholder(period: number, sourceImageIndex: 1 | 2): Promise<RawRow[]> {
@@ -256,15 +528,17 @@ export default function Home() {
   const [rows, setRows] = useState<RawRow[]>(initialRows);
   const [images, setImages] = useState<Record<number, Partial<Record<1 | 2, UploadedImage>>>>({});
   const [config, setConfig] = useState<BuildingConfig>(defaultBuildingConfig);
+  const [assignmentOverrides, setAssignmentOverrides] = useState<Record<string, AssignmentOverride>>({});
   const [ocrBusy, setOcrBusy] = useState(false);
 
   const lessons = useMemo(() => rowsToLessons(rows), [rows]);
-  const assignments = useMemo(() => createAssignments(lessons), [lessons]);
-  const warnings = useMemo(() => createWarnings(rows, assignments), [rows, assignments]);
+  const assignments = useMemo(() => createAssignments(lessons, config, assignmentOverrides), [lessons, config, assignmentOverrides]);
+  const warnings = useMemo(() => createWarnings(rows, lessons, assignments, config), [rows, lessons, assignments, config]);
+  const unassignedLessons = useMemo(() => createUnassignedLessons(lessons, assignments), [lessons, assignments]);
+  const assignmentSummary = useMemo(() => getAssignmentSummary(assignments, warnings), [assignments, warnings]);
   const teacherNames = useMemo(() => Array.from(new Set(rows.map((row) => row.teacherName).filter(Boolean))).sort(), [rows]);
 
   const selectedRows = rows.filter((row) => row.period === selectedPeriod && row.sourceImageIndex === selectedSource);
-  const currentImage = images[selectedPeriod]?.[selectedSource];
   const selectedTitle = screens.find((screen) => screen.id === activeScreen)?.label ?? "";
 
   function updateRow(id: string, key: keyof RawRow, value: string) {
@@ -287,6 +561,18 @@ export default function Home() {
 
   function deleteRow(id: string) {
     setRows((current) => current.filter((row) => row.id !== id));
+  }
+
+  function updateAssignmentOverride(lessonId: string, override?: AssignmentOverride) {
+    setAssignmentOverrides((current) => {
+      const next = { ...current };
+      if (override) {
+        next[lessonId] = override;
+      } else {
+        delete next[lessonId];
+      }
+      return next;
+    });
   }
 
   function handleImage(event: ChangeEvent<HTMLInputElement>, source: 1 | 2) {
@@ -375,6 +661,7 @@ export default function Home() {
             selectedSource={selectedSource}
             setSelectedSource={setSelectedSource}
             selectedRows={selectedRows}
+            periodLessons={lessons.filter((lesson) => lesson.period === selectedPeriod)}
             teacherNames={teacherNames}
             updateRow={updateRow}
             deleteRow={deleteRow}
@@ -386,11 +673,16 @@ export default function Home() {
             selectedPeriod={selectedPeriod}
             setSelectedPeriod={setSelectedPeriod}
             assignments={assignments}
+            unassignedLessons={unassignedLessons}
+            summary={assignmentSummary}
+            config={config}
+            overrides={assignmentOverrides}
+            updateOverride={updateAssignmentOverride}
           />
         )}
         {activeScreen === "teachers" && <DiagramScreen mode="teachers" assignments={assignments} />}
         {activeScreen === "students" && <DiagramScreen mode="students" assignments={assignments} />}
-        {activeScreen === "warnings" && <WarningsScreen warnings={warnings} />}
+        {activeScreen === "warnings" && <WarningsScreen warnings={warnings} assignments={assignments} />}
         {activeScreen === "settings" && <SettingsScreen config={config} setConfig={setConfig} />}
       </section>
     </main>
@@ -491,6 +783,7 @@ function OcrScreen(props: {
   selectedSource: 1 | 2;
   setSelectedSource: (source: 1 | 2) => void;
   selectedRows: RawRow[];
+  periodLessons: Lesson[];
   teacherNames: string[];
   updateRow: (id: string, key: keyof RawRow, value: string) => void;
   deleteRow: (id: string) => void;
@@ -548,17 +841,56 @@ function OcrScreen(props: {
           {rawTextSamples[`${props.selectedPeriod}-${props.selectedSource}`] ?? "OCRテキストは未取得です"}
         </pre>
       </details>
+      <div className="rounded-md border border-line p-3">
+        <SectionTitle title={`${props.selectedPeriod}コマの統合プレビュー`} />
+        <div className="grid gap-2">
+          {props.periodLessons.map((lesson) => (
+            <div key={lesson.id} className="rounded-md bg-slate-50 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-sm font-bold">{lesson.teacherName || "講師未入力"}</div>
+                <span className={classNames("rounded-md px-2 py-1 text-xs font-bold", lesson.students.length >= 3 ? "bg-red-50 text-red-600" : "bg-blue-50 text-appblue")}>
+                  {lesson.students.length}人
+                </span>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {lesson.students.map((student) => (
+                  <span key={`${lesson.id}-${student.name}-${student.grade}`} className="rounded-md bg-white px-2 py-1 text-xs font-bold text-slate-600">
+                    {student.name || "生徒未入力"} {student.grade ? `/ ${student.grade}` : ""}
+                  </span>
+                ))}
+                {lesson.hasElementaryStudent && <span className="rounded-md bg-amber-50 px-2 py-1 text-xs font-bold text-amber-700">本館優先</span>}
+              </div>
+            </div>
+          ))}
+          {props.periodLessons.length === 0 && <EmptyState text="統合できるOCR行はまだありません" />}
+        </div>
+      </div>
     </div>
   );
 }
 
-function SeatingScreen(props: { selectedPeriod: number; setSelectedPeriod: (period: number) => void; assignments: Assignment[] }) {
+function SeatingScreen(props: {
+  selectedPeriod: number;
+  setSelectedPeriod: (period: number) => void;
+  assignments: Assignment[];
+  unassignedLessons: Lesson[];
+  summary: ReturnType<typeof getAssignmentSummary>;
+  config: BuildingConfig;
+  overrides: Record<string, AssignmentOverride>;
+  updateOverride: (lessonId: string, override?: AssignmentOverride) => void;
+}) {
   const periodAssignments = props.assignments.filter((assignment) => assignment.period === props.selectedPeriod);
+  const periodUnassigned = props.unassignedLessons.filter((lesson) => lesson.period === props.selectedPeriod);
   const bySeat = new Map(periodAssignments.map((assignment) => [assignment.seatLabel, assignment]));
   const remote = (buildingId: BuildingId) => periodAssignments.filter((assignment) => assignment.buildingId === buildingId);
   return (
     <div className="space-y-5">
       <PeriodPicker selectedPeriod={props.selectedPeriod} onChange={props.setSelectedPeriod} />
+      <div className="grid grid-cols-3 gap-2">
+        <MetricCard label="配置済み" value={`${props.summary.assignedCount}`} />
+        <MetricCard label="未配置" value={`${props.summary.unassignedCount}`} tone={props.summary.unassignedCount > 0 ? "warn" : "normal"} />
+        <MetricCard label="警告" value={`${props.summary.warningCount}`} tone={props.summary.warningCount > 0 ? "warn" : "normal"} />
+      </div>
       <SectionTitle title="本館" right={<span className="text-xs font-bold text-slate-500">実レイアウト</span>} />
       <div className="rounded-md border border-blue-100 bg-blue-50 p-3">
         <div className="grid grid-cols-4 gap-2">
@@ -585,6 +917,106 @@ function SeatingScreen(props: { selectedPeriod: number; setSelectedPeriod: (peri
       </div>
       <RemoteBuilding title="2号館" assignments={remote("building2")} color="green" />
       <RemoteBuilding title="3号館" assignments={remote("building3")} color="purple" />
+      <AdjustmentPanel
+        assignments={periodAssignments}
+        config={props.config}
+        overrides={props.overrides}
+        updateOverride={props.updateOverride}
+      />
+      {periodUnassigned.length > 0 && (
+        <div>
+          <SectionTitle title="未配置" />
+          <div className="grid gap-2 rounded-md border border-amber-200 bg-amber-50 p-3">
+            {periodUnassigned.map((lesson) => (
+              <div key={lesson.id} className="rounded-md bg-white px-3 py-2 text-sm font-bold text-amber-800">
+                {lesson.teacherName || "講師未入力"} / {lesson.students.map((student) => student.name || "生徒未入力").join("、")}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AdjustmentPanel({
+  assignments,
+  config,
+  overrides,
+  updateOverride,
+}: {
+  assignments: Assignment[];
+  config: BuildingConfig;
+  overrides: Record<string, AssignmentOverride>;
+  updateOverride: (lessonId: string, override?: AssignmentOverride) => void;
+}) {
+  if (assignments.length === 0) return null;
+  return (
+    <div>
+      <SectionTitle title="手動調整" />
+      <div className="grid gap-2 rounded-md border border-line p-3">
+        {assignments.map((assignment) => {
+          const override = overrides[assignment.lessonId];
+          const buildingId = override?.buildingId ?? assignment.buildingId;
+          const maxSeat = maxTeachersForBuilding(buildingId, config);
+          return (
+            <div key={assignment.id} className="rounded-md bg-slate-50 p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div className="text-sm font-bold">{assignment.teacherName}</div>
+                <button
+                  type="button"
+                  onClick={() => updateOverride(assignment.lessonId)}
+                  className="rounded-md border border-line bg-white px-2 py-1 text-xs font-bold text-slate-600 active:translate-y-px"
+                >
+                  自動
+                </button>
+              </div>
+              <div className="grid grid-cols-[1fr_90px] gap-2">
+                <label className="grid gap-1">
+                  <span className="text-xs font-bold text-slate-500">建物</span>
+                  <select
+                    className="input"
+                    value={buildingId}
+                    onChange={(event) => {
+                      const nextBuildingId = event.target.value as BuildingId;
+                      updateOverride(assignment.lessonId, { buildingId: nextBuildingId, seatNumber: 1 });
+                    }}
+                  >
+                    {buildings.map((building) => (
+                      <option key={building.id} value={building.id}>
+                        {building.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="grid gap-1">
+                  <span className="text-xs font-bold text-slate-500">座席</span>
+                  <select
+                    className="input"
+                    value={Math.min(override?.seatNumber ?? assignment.seatNumber, maxSeat)}
+                    onChange={(event) => updateOverride(assignment.lessonId, { buildingId, seatNumber: Number(event.target.value) })}
+                  >
+                    {Array.from({ length: maxSeat }, (_, index) => index + 1).map((seatNumber) => (
+                      <option key={seatNumber} value={seatNumber}>
+                        {seatNumber}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function MetricCard({ label, value, tone = "normal" }: { label: string; value: string; tone?: "normal" | "warn" }) {
+  return (
+    <div className={classNames("rounded-md border p-2", tone === "warn" ? "border-amber-200 bg-amber-50" : "border-line bg-slate-50")}>
+      <div className="text-[11px] font-bold text-slate-500">{label}</div>
+      <div className={classNames("mt-1 text-lg font-bold", tone === "warn" ? "text-amber-700" : "text-ink")}>{value}</div>
     </div>
   );
 }
@@ -677,13 +1109,34 @@ function DiagramCell({ assignment }: { assignment?: Assignment }) {
   );
 }
 
-function WarningsScreen({ warnings }: { warnings: SeatingWarning[] }) {
+function WarningsScreen({ warnings, assignments }: { warnings: SeatingWarning[]; assignments: Assignment[] }) {
+  const [copied, setCopied] = useState(false);
+  const outputText = useMemo(() => buildOutputText(assignments, warnings), [assignments, warnings]);
+
+  async function copyOutput() {
+    await navigator.clipboard.writeText(outputText);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1400);
+  }
+
   return (
     <div className="space-y-3">
+      <div className="rounded-md border border-line p-3">
+        <SectionTitle title="出力" />
+        <div className="grid grid-cols-2 gap-2">
+          <button type="button" onClick={copyOutput} className="rounded-md bg-appblue px-3 py-3 text-sm font-bold text-white active:translate-y-px">
+            {copied ? "コピー済み" : "テキストコピー"}
+          </button>
+          <button type="button" onClick={() => window.print()} className="rounded-md border border-appblue bg-white px-3 py-3 text-sm font-bold text-appblue active:translate-y-px">
+            印刷
+          </button>
+        </div>
+        <textarea className="input mt-3 min-h-32 text-xs" value={outputText} readOnly />
+      </div>
       {warnings.map((warning) => (
         <div key={warning.id} className="rounded-md border border-amber-200 bg-amber-50 p-3">
           <div className="mb-2 flex items-center justify-between gap-2">
-            <span className="rounded-md bg-white px-2 py-1 text-xs font-bold text-amber-700">{warning.type}</span>
+            <span className="rounded-md bg-white px-2 py-1 text-xs font-bold text-amber-700">{createWarningsLabel(warning.type)}</span>
             <span className="text-xs font-bold text-amber-700">{warning.period}コマ</span>
           </div>
           <div className="text-sm font-bold">{warning.target ?? "全体"}</div>
