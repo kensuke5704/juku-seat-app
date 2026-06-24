@@ -97,27 +97,27 @@ const periods = [1, 2, 3, 4, 5, 6, 7, 8];
 const sourceTabs: Array<1 | 2> = [1, 2];
 
 const buildings: Building[] = [
-  { id: "main", name: "本館", actualSeatCount: 14, defaultUsableSeatCount: 14 },
+  { id: "main", name: "本館", actualSeatCount: 12, defaultUsableSeatCount: 12 },
   { id: "building2", name: "2号館", actualSeatCount: 10, defaultUsableSeatCount: 6 },
   { id: "building3", name: "3号館", actualSeatCount: 8, defaultUsableSeatCount: 5 },
 ];
 
 const defaultBuildingConfig: BuildingConfig = {
-  mainMaxTeachers: 14,
+  mainMaxTeachers: 12,
   building2MaxTeachers: 6,
   building3MaxTeachers: 5,
 };
 
 const mainSeatLayout = [
-  ["H-06", null, null, "H-01"],
-  ["H-07", "H-04", null, "H-02"],
-  ["H-08", "H-05", null, "H-03"],
-  ["aisle", "aisle", "aisle", "aisle"],
-  ["H-14", "H-12", null, "H-10"],
-  ["H-13", "H-11", null, "H-09"],
+  ["H-06", null, "H-01"],
+  ["H-07", "H-04", "H-02"],
+  ["H-08", "H-05", "H-03"],
+  ["aisle", "aisle", "aisle"],
+  ["H-12", "H-10", null],
+  ["H-11", "H-09", null],
 ];
 
-const mainSeatOrder = [1, 4, 7, 2, 5, 8, 3, 10, 12, 14, 9, 11, 13, 6];
+const mainSeatOrder = [1, 4, 7, 2, 5, 8, 3, 10, 12, 9, 11, 6];
 
 const initialRows: RawRow[] = [];
 
@@ -432,31 +432,6 @@ function getAssignmentSummary(assignments: Assignment[], warnings: SeatingWarnin
   };
 }
 
-function buildOutputText(assignments: Assignment[], warnings: SeatingWarning[]) {
-  const lines = ["塾 座席割り振り", ""];
-  for (const period of periods) {
-    const periodAssignments = assignments.filter((assignment) => assignment.period === period);
-    lines.push(`${period}コマ`);
-    if (periodAssignments.length === 0) {
-      lines.push("配置なし");
-    } else {
-      for (const assignment of periodAssignments) {
-        lines.push(`${assignment.buildingName} ${assignment.seatLabel} ${assignment.teacherName}`);
-      }
-    }
-    lines.push("");
-  }
-  lines.push("注意・警告");
-  if (warnings.length === 0) {
-    lines.push("なし");
-  } else {
-    for (const warning of warnings) {
-      lines.push(`${warning.period}コマ ${createWarningsLabel(warning.type)} ${warning.target ?? "全体"} ${warning.message}`);
-    }
-  }
-  return lines.join("\n");
-}
-
 function parseOcrText(text: string, period: number, sourceImageIndex: 1 | 2): RawRow[] {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const headerIndex = lines.findIndex((line) => /(講師|担当講師|先生)/.test(line) && line.includes("生徒") && line.includes("学年"));
@@ -625,7 +600,7 @@ export default function Home() {
       <header className="sticky top-0 z-10 border-b border-line bg-white/95 px-4 py-3 backdrop-blur">
         <div>
           <div>
-            <p className="text-xs font-bold text-appblue">塾 座席割り振り</p>
+            <p className="text-xs font-bold text-appblue">配置</p>
             <h1 className="text-lg font-bold tracking-normal">{selectedTitle}</h1>
           </div>
         </div>
@@ -691,7 +666,7 @@ export default function Home() {
         )}
         {activeScreen === "teachers" && <DiagramScreen mode="teachers" assignments={assignments} />}
         {activeScreen === "students" && <DiagramScreen mode="students" assignments={assignments} />}
-        {activeScreen === "warnings" && <WarningsScreen warnings={warnings} assignments={assignments} />}
+        {activeScreen === "warnings" && <WarningsScreen warnings={warnings} />}
         {activeScreen === "settings" && <SettingsScreen config={config} setConfig={setConfig} />}
       </section>
     </main>
@@ -748,27 +723,36 @@ function UploadScreen(props: {
             <div key={source} className="rounded-md border border-line bg-slate-50 p-3">
               <div className="mb-3 flex items-center justify-between">
                 <div className="font-bold">一覧表{source}</div>
-                <span className="text-xs text-slate-500">最大2枚</span>
               </div>
               {image ? (
                 <div className="space-y-3">
                   <img src={image.previewUrl} alt={`一覧表${source}`} className="h-36 w-full rounded-md object-cover" />
                   <p className="truncate text-sm text-slate-600">{image.fileName}</p>
-                  <div className="flex gap-2">
-                    <label className="flex-1 cursor-pointer rounded-md border border-appblue bg-white px-3 py-2 text-center text-sm font-bold text-appblue active:translate-y-px">
-                      画像を変更
+                  <div className="grid grid-cols-2 gap-2">
+                    <label className="cursor-pointer rounded-md border border-appblue bg-white px-3 py-2 text-center text-sm font-bold text-appblue active:translate-y-px">
+                      写真から変更
+                      <input className="hidden" type="file" accept="image/*" onChange={(event) => props.handleImage(event, source)} />
+                    </label>
+                    <label className="cursor-pointer rounded-md border border-appblue bg-white px-3 py-2 text-center text-sm font-bold text-appblue active:translate-y-px">
+                      カメラで撮影
                       <input className="hidden" type="file" accept="image/*" capture="environment" onChange={(event) => props.handleImage(event, source)} />
                     </label>
-                    <button type="button" onClick={() => props.deleteImage(source)} className="rounded-md border border-red-200 bg-white px-3 py-2 text-sm font-bold text-red-600 active:translate-y-px">
+                    <button type="button" onClick={() => props.deleteImage(source)} className="col-span-2 rounded-md border border-red-200 bg-white px-3 py-2 text-sm font-bold text-red-600 active:translate-y-px">
                       削除
                     </button>
                   </div>
                 </div>
               ) : (
-                <label className="block cursor-pointer rounded-md border border-dashed border-blue-300 bg-white px-3 py-8 text-center text-sm font-bold text-appblue active:translate-y-px">
-                  画像を追加
-                  <input className="hidden" type="file" accept="image/*" capture="environment" onChange={(event) => props.handleImage(event, source)} />
-                </label>
+                <div className="grid gap-2">
+                  <label className="block cursor-pointer rounded-md border border-dashed border-blue-300 bg-white px-3 py-5 text-center text-sm font-bold text-appblue active:translate-y-px">
+                    写真から追加
+                    <input className="hidden" type="file" accept="image/*" onChange={(event) => props.handleImage(event, source)} />
+                  </label>
+                  <label className="block cursor-pointer rounded-md border border-blue-200 bg-white px-3 py-3 text-center text-sm font-bold text-appblue active:translate-y-px">
+                    カメラで撮影
+                    <input className="hidden" type="file" accept="image/*" capture="environment" onChange={(event) => props.handleImage(event, source)} />
+                  </label>
+                </div>
               )}
             </div>
           );
@@ -916,14 +900,12 @@ function SeatingScreen(props: {
       </div>
       <SectionTitle title="本館" right={<span className="text-xs font-bold text-slate-500">実レイアウト</span>} />
       <div className="rounded-md border border-blue-100 bg-blue-50 p-3">
-        <div className="grid grid-cols-4 gap-2">
+        <div className="grid grid-cols-3 gap-2">
           {mainSeatLayout.flatMap((row, rowIndex) =>
             row.map((seat, colIndex) => {
               if (seat === "aisle") {
                 return colIndex === 0 ? (
-                  <div key={`${rowIndex}-${colIndex}`} className="col-span-4 rounded-md border border-dashed border-blue-200 py-2 text-center text-xs font-bold text-blue-500">
-                    通路
-                  </div>
+                  <div key={`${rowIndex}-${colIndex}`} className="col-span-3 h-8 rounded-md border border-dashed border-blue-200" />
                 ) : null;
               }
               if (!seat) return <div key={`${rowIndex}-${colIndex}`} />;
@@ -1141,32 +1123,9 @@ function DiagramCell({ assignment }: { assignment?: Assignment }) {
   );
 }
 
-function WarningsScreen({ warnings, assignments }: { warnings: SeatingWarning[]; assignments: Assignment[] }) {
-  const [copied, setCopied] = useState(false);
-  const outputText = useMemo(() => buildOutputText(assignments, warnings), [assignments, warnings]);
-
-  async function copyOutput() {
-    await navigator.clipboard.writeText(outputText);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1400);
-  }
-
+function WarningsScreen({ warnings }: { warnings: SeatingWarning[] }) {
   return (
     <div className="space-y-3">
-      <div className="rounded-md border border-line p-3">
-        <div className="no-print">
-          <SectionTitle title="出力" />
-        </div>
-        <div className="no-print grid grid-cols-2 gap-2">
-          <button type="button" onClick={copyOutput} className="rounded-md bg-appblue px-3 py-3 text-sm font-bold text-white active:translate-y-px">
-            {copied ? "コピー済み" : "テキストコピー"}
-          </button>
-          <button type="button" onClick={() => window.print()} className="rounded-md border border-appblue bg-white px-3 py-3 text-sm font-bold text-appblue active:translate-y-px">
-            印刷
-          </button>
-        </div>
-        <textarea className="input mt-3 min-h-32 text-xs" value={outputText} readOnly aria-label="出力テキスト" />
-      </div>
       {warnings.map((warning) => (
         <div key={warning.id} className="rounded-md border border-amber-200 bg-amber-50 p-3">
           <div className="mb-2 flex items-center justify-between gap-2">
@@ -1187,7 +1146,7 @@ function SettingsScreen({ config, setConfig }: { config: BuildingConfig; setConf
     <div className="space-y-4">
       <div className="rounded-md border border-line p-3">
         <div className="text-sm font-bold">本館最大講師人数</div>
-        <div className="mt-2 rounded-md bg-slate-50 px-3 py-2 text-lg font-bold">14 固定</div>
+        <div className="mt-2 rounded-md bg-slate-50 px-3 py-2 text-lg font-bold">12 固定</div>
       </div>
       <RangeSetting
         label="2号館最大講師人数"

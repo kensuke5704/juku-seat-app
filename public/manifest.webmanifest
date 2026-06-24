@@ -1,0 +1,11 @@
+{
+  "name": "配置",
+  "short_name": "配置",
+  "description": "スマホ向けの塾座席割り振りプロトタイプ",
+  "display": "standalone",
+  "start_url": ".",
+  "scope": ".",
+  "background_color": "#f7faff",
+  "theme_color": "#2563eb",
+  "lang": "ja"
+}
