@@ -94,6 +94,15 @@ type DiagramPerson = {
   grade?: string;
 };
 
+type OcrWorker = {
+  recognize: (
+    image: string,
+    options?: Partial<{ rotateAuto: boolean }>,
+    output?: Partial<{ text: boolean }>,
+  ) => Promise<{ data: { text: string; confidence?: number } }>;
+  setParameters: (params: Record<string, string>) => Promise<unknown>;
+};
+
 const periods = [1, 2, 3, 4, 5, 6, 7, 8];
 const sourceTabs: Array<1 | 2> = [1, 2];
 
@@ -121,6 +130,8 @@ const mainSeatLayout = [
 const mainSeatOrder = [1, 4, 7, 2, 5, 8, 3, 10, 12, 9, 11, 6];
 
 const initialRows: RawRow[] = [];
+let ocrWorkerPromise: Promise<OcrWorker> | null = null;
+let currentOcrProgress = (_message: string) => {};
 
 function sourceKey(period: number, sourceImageIndex: 1 | 2) {
   return `${period}-${sourceImageIndex}`;
@@ -456,7 +467,19 @@ function parseOcrText(text: string, period: number, sourceImageIndex: 1 | 2): Ra
 }
 
 function parseDataLine(line: string) {
-  const tokens = line.split(/[\s　\t]+/).filter(Boolean);
+  const normalizedLine = line.replace(/[|｜,，、:：]+/g, " ").replace(/\s+/g, " ").trim();
+  const compactGradeMatch = normalizedLine.match(/^(.*?)(小[1-6]|中[1-3]|高[1-3]|小学生|小学[1-6]年)$/);
+  if (compactGradeMatch && !/[\s　\t]/.test(compactGradeMatch[1])) {
+    const names = compactGradeMatch[1];
+    const middle = Math.max(1, Math.floor(names.length / 2));
+    return {
+      teacherName: names.slice(0, middle),
+      studentName: names.slice(middle),
+      grade: compactGradeMatch[2],
+    };
+  }
+
+  const tokens = normalizedLine.split(/[\s　\t]+/).filter(Boolean);
   const gradeIndex = tokens.findIndex((token) => /^(小[1-6]|中[1-3]|高[1-3]|小学生|小学[1-6]年)$/.test(token));
   const grade = gradeIndex >= 0 ? tokens[gradeIndex] : tokens[4];
   const nameTokens = tokens.slice(0, gradeIndex >= 0 ? gradeIndex : 4);
@@ -488,18 +511,124 @@ async function runOcrPlaceholder(period: number, sourceImageIndex: 1 | 2, rawTex
 }
 
 async function recognizeImageText(file: File, onProgress: (message: string) => void) {
+  currentOcrProgress = onProgress;
   onProgress("OCRを準備しています");
-  const { recognize } = await import("tesseract.js");
-  const result = await recognize(file, "jpn+eng", {
-    logger: (message) => {
-      if (message.status === "recognizing text") {
-        onProgress(`OCR実行中 ${Math.round(message.progress * 100)}%`);
-        return;
-      }
-      if (message.status) onProgress(`OCR実行中: ${message.status}`);
-    },
+  const worker = await getOcrWorker();
+  const firstImage = await prepareImageForOcr(file, 0);
+  onProgress("OCR実行中 0度");
+  const firstResult = await worker.recognize(firstImage, { rotateAuto: true }, { text: true });
+  let best = {
+    text: firstResult.data.text.trim(),
+    score: scoreOcrText(firstResult.data.text, firstResult.data.confidence),
+  };
+
+  if (best.score < 80) {
+    for (const rotation of [90, 180, 270]) {
+      onProgress(`OCR実行中 ${rotation}度`);
+      const rotatedImage = await prepareImageForOcr(file, rotation);
+      const result = await worker.recognize(rotatedImage, { rotateAuto: true }, { text: true });
+      const text = result.data.text.trim();
+      const score = scoreOcrText(text, result.data.confidence);
+      if (score > best.score) best = { text, score };
+    }
+  }
+
+  return best.text;
+}
+
+async function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    const { createWorker } = await import("tesseract.js");
+    const basePath = getRuntimeBasePath();
+    ocrWorkerPromise = createWorker("jpn+eng", 1, {
+      workerPath: `${basePath}/tesseract/worker.min.js`,
+      corePath: `${basePath}/tesseract-core`,
+      langPath: "https://tessdata.projectnaptha.com/4.0.0",
+      cacheMethod: "write",
+      logger: (message) => {
+        if (message.status === "recognizing text") {
+          currentOcrProgress(`OCR実行中 ${Math.round(message.progress * 100)}%`);
+          return;
+        }
+        if (message.status) currentOcrProgress(`OCR実行中: ${message.status}`);
+      },
+    }).then(async (worker: OcrWorker) => {
+      await worker.setParameters({
+        tessedit_pageseg_mode: "11",
+        preserve_interword_spaces: "1",
+        user_defined_dpi: "300",
+      });
+      return worker;
+    });
+  }
+  return ocrWorkerPromise;
+}
+
+function getRuntimeBasePath() {
+  if (typeof document === "undefined") return "";
+  const manifestHref = document.querySelector<HTMLLinkElement>('link[rel="manifest"]')?.href;
+  if (!manifestHref) return "";
+  const path = new URL(manifestHref).pathname.replace(/\/manifest\.webmanifest$/, "");
+  return path === "/" ? "" : path;
+}
+
+async function prepareImageForOcr(file: File, rotation: number) {
+  const image = await loadImageElement(file);
+  const sourceWidth = image.naturalWidth || image.width;
+  const sourceHeight = image.naturalHeight || image.height;
+  const maxSide = 1800;
+  const scale = Math.min(1, maxSide / Math.max(sourceWidth, sourceHeight));
+  const width = Math.max(1, Math.round(sourceWidth * scale));
+  const height = Math.max(1, Math.round(sourceHeight * scale));
+  const rotated = rotation % 180 !== 0;
+  const canvas = document.createElement("canvas");
+  canvas.width = rotated ? height : width;
+  canvas.height = rotated ? width : height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) return URL.createObjectURL(file);
+
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.translate(canvas.width / 2, canvas.height / 2);
+  context.rotate((rotation * Math.PI) / 180);
+  context.drawImage(image, -width / 2, -height / 2, width, height);
+  context.setTransform(1, 0, 0, 1, 0, 0);
+
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const pixels = imageData.data;
+  for (let index = 0; index < pixels.length; index += 4) {
+    const gray = pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114;
+    const contrast = Math.max(0, Math.min(255, (gray - 128) * 1.35 + 128));
+    const value = contrast > 188 ? 255 : contrast < 92 ? 0 : contrast;
+    pixels[index] = value;
+    pixels[index + 1] = value;
+    pixels[index + 2] = value;
+  }
+  context.putImageData(imageData, 0, 0);
+  return canvas.toDataURL("image/png");
+}
+
+function loadImageElement(file: File) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("画像を読み込めませんでした"));
+    };
+    image.src = url;
   });
-  return result.data.text.trim();
+}
+
+function scoreOcrText(text: string, confidence = 0) {
+  const usefulChars = (text.match(/[一-龯ぁ-んァ-ヶA-Za-z0-9]/g) ?? []).length;
+  const gradeHits = (text.match(/小[1-6]|中[1-3]|高[1-3]|小学[1-6]年/g) ?? []).length;
+  const lineHits = text.split(/\r?\n/).filter((line) => line.trim().split(/[\s　\t]+/).length >= 2).length;
+  return usefulChars + gradeHits * 15 + lineHits * 10 + confidence * 0.25;
 }
 
 function classNames(...values: Array<string | false | undefined>) {
